@@ -8,4 +8,15 @@ layout:
 - go.kubebuilder.io/v4
 projectName: dojo-operator
 repo: github.com/DanijelRadakovic/dojo-operator
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: jutsu.com
+  group: core
+  kind: Dojo
+  path: github.com/DanijelRadakovic/dojo-operator/api/v1
+  plural: dojos
+  version: v1
 version: "3"

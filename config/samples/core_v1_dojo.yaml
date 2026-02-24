@@ -1,0 +1,15 @@
+apiVersion: core.jutsu.com/v1
+kind: Dojo
+metadata:
+  labels:
+    app.kubernetes.io/name: dojo-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: tokyo-jujutsu-high
+spec:
+  accountId: The Higher-Ups
+  title: Tokyo Jujutsu High
+  replicas: 3
+  database: Postgres
+  credentialsRef:
+    name: dojo
+    namespace: default
