@@ -10,7 +10,6 @@ spec:
   names:
     categories:
     - all
-    - jutsu
     kind: Dojo
     listKind: DojoList
     plural: dojos

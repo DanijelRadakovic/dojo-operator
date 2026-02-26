@@ -30,19 +30,24 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	corev1 "github.com/DanijelRadakovic/dojo-operator/api/v1"
 )
 
 const (
-	// typeAvailableDojo represents the status of the Dojo reconciliation
-	typeAvailableDojo = "Available"
-	// typeProgressingDojo represents the status used when the Dojo is being reconciled
-	typeProgressingDojo = "Progressing"
-	// typeDegradedDojo represents the status used when the Dojo has encountered an error
-	typeDegradedDojo = "Degraded"
+	// ConditionAvailableDojo represents the status of the Dojo reconciliation
+	ConditionAvailableDojo = "Available"
+	// ConditionProgressingDojo represents the status used when the Dojo is being reconciled
+	ConditionProgressingDojo = "Progressing"
+	// ConditionDegradedDojo represents the status used when the Dojo has encountered an error
+	ConditionDegradedDojo = "Degraded"
 
 	ReasonReady    = "Ready"
 	ReasonFinished = "Finished"
@@ -66,14 +71,13 @@ type DojoReconciler struct {
 // +kubebuilder:rbac:groups=core.jutsu.com,resources=dojos,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core.jutsu.com,resources=dojos/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=core.jutsu.com,resources=dojos/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.23.0/pkg/reconcile
 func (r *DojoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
 	dojo := &corev1.Dojo{}
 	if err := r.Get(ctx, req.NamespacedName, dojo); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -81,7 +85,7 @@ func (r *DojoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	if len(dojo.Status.Conditions) == 0 {
 		meta.SetStatusCondition(&dojo.Status.Conditions, metav1.Condition{
-			Type:    typeProgressingDojo,
+			Type:    ConditionProgressingDojo,
 			Status:  metav1.ConditionTrue,
 			Reason:  ReasonInitializing,
 			Message: "Operator has started reconciling this resource",
@@ -89,6 +93,91 @@ func (r *DojoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, r.Status().Update(ctx, dojo)
 	}
 
+	if result, err := r.reconcileCredentials(ctx, dojo); err != nil || result != nil {
+		return *result, err
+	}
+
+	result, err := r.reconcileDeployment(ctx, dojo)
+	if result == nil {
+		return ctrl.Result{}, err
+	}
+	return *result, err
+}
+
+func (r *DojoReconciler) reconcileCredentials(ctx context.Context, dojo *corev1.Dojo) (*ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	// Check if the secret already exists
+	appSecretName := dojo.Name + "-credentials"
+	err := r.Get(ctx, types.NamespacedName{Name: appSecretName, Namespace: dojo.Namespace}, &k8scorev1.Secret{})
+
+	if apierrors.IsNotFound(err) {
+		secret := &k8scorev1.Secret{}
+		err = r.Get(ctx, types.NamespacedName{Name: dojo.Spec.CredentialsRef.Name, Namespace: dojo.Spec.CredentialsRef.Namespace}, secret)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				log.Error(err, "Failed to find credentials secret")
+				return r.setUnrecoverableErrorStatus(ctx, dojo, ReasonFailed, "Failed to find credentials secret")
+			}
+			return &ctrl.Result{}, err
+		}
+
+		appSecret := &k8scorev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      appSecretName,
+				Namespace: dojo.Namespace,
+				Labels:    r.labels(dojo.Name),
+			},
+			Type: k8scorev1.SecretTypeOpaque,
+		}
+
+		if ptr.Deref(dojo.Spec.Database, "") == corev1.DatabasePostgres {
+			// The CNPG Database resource with correct owner should be present in cluster.
+			// The secret contains several properties, in our case we are using the `uri` property which
+			// contains full URI to the database.
+			appSecret.Data = map[string][]byte{
+				"DB_ENDPOINT": secret.Data["host"],
+				"DB_PORT":     secret.Data["port"],
+				"DB_NAME":     secret.Data["dbname"],
+				"DB_USER":     secret.Data["user"],
+				"DB_PASS":     secret.Data["password"],
+			}
+		} else if ptr.Deref(dojo.Spec.Database, "") == corev1.DatabaseMongo {
+			// Integrate with the MongoDB operator: https://www.mongodb.com/docs/kubernetes/current/
+			log.Error(err, "Mongo database is not yet supported")
+			return r.setUnrecoverableErrorStatus(ctx, dojo, ReasonFailed, "Mongo database is not yet supported")
+		}
+
+		// Set the Dojo as the owner so the secret is deleted when the Dojo is deleted
+		if err = controllerutil.SetControllerReference(dojo, appSecret, r.Scheme); err != nil {
+			log.Error(err, "Failed to define Secret ownership")
+			return r.setUnrecoverableErrorStatus(ctx, dojo, ReasonStalled, "Could not define Secret ownership")
+		}
+
+		log.Info("Creating Secret")
+		if err = r.Create(ctx, appSecret); err != nil && !apierrors.IsAlreadyExists(err) {
+			log.Error(err, "Failed to create Secret")
+			return r.setUnrecoverableErrorStatus(ctx, dojo, ReasonFailed, "Failed to create Secret in the cluster")
+		}
+
+		dojo.Status.Credentials = k8scorev1.SecretReference{Name: appSecret.Name, Namespace: appSecret.Namespace}
+		return r.setProgressStatus(ctx, dojo, ReasonCreating, "Credentials secret created")
+	} else if err != nil {
+		return r.setUnrecoverableErrorStatus(ctx, dojo, ReasonFailed, "Failed to communicate with the cluster")
+	}
+
+	// There are scenarios when secret is created but the status for the dojo is not updated. Here are the examples:
+	// - The secret is created but the update for dojo status failed, because API could not be reached.
+	// - The secret is created, the dojo status is updated but the change is not yet propagated.
+	// Because of that, we need to check and reupdate the status and conditions, also not progressing to next step of reconciliation.
+	if dojo.Status.Credentials == (k8scorev1.SecretReference{}) {
+		dojo.Status.Credentials = k8scorev1.SecretReference{Name: appSecretName, Namespace: dojo.Namespace}
+		return r.setProgressStatus(ctx, dojo, ReasonCreating, "Credentials secret created")
+	}
+	return nil, nil
+}
+
+func (r *DojoReconciler) reconcileDeployment(ctx context.Context, dojo *corev1.Dojo) (*ctrl.Result, error) {
+	log := logf.FromContext(ctx)
 	// Check if the deployment already exists, if not create a new one
 	found := &appsv1.Deployment{}
 	err := r.Get(ctx, types.NamespacedName{Name: dojo.Name, Namespace: dojo.Namespace}, found)
@@ -121,7 +210,7 @@ func (r *DojoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			return r.setUnrecoverableErrorStatus(ctx, dojo, ReasonFailed, "Failed to update Deployment replica count")
 		}
 		// Return and let the Deployment update event trigger the next loop
-		return ctrl.Result{}, nil
+		return &ctrl.Result{}, nil
 	}
 
 	readyReplicas := found.Status.ReadyReplicas
@@ -134,14 +223,14 @@ func (r *DojoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// Set Available Condition
 	if readyReplicas > 0 {
 		meta.SetStatusCondition(&dojo.Status.Conditions, metav1.Condition{
-			Type:    typeAvailableDojo,
+			Type:    ConditionAvailableDojo,
 			Status:  metav1.ConditionTrue,
 			Reason:  ReasonReady,
 			Message: fmt.Sprintf("%d/%d replicas are serving traffic", readyReplicas, desiredReplicas),
 		})
 	} else {
 		meta.SetStatusCondition(&dojo.Status.Conditions, metav1.Condition{
-			Type:    typeAvailableDojo,
+			Type:    ConditionAvailableDojo,
 			Status:  metav1.ConditionFalse,
 			Reason:  ReasonUnavailable,
 			Message: "No replicas are currently ready",
@@ -151,14 +240,14 @@ func (r *DojoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// Set Progressing Condition
 	if readyReplicas == desiredReplicas {
 		meta.SetStatusCondition(&dojo.Status.Conditions, metav1.Condition{
-			Type:    typeProgressingDojo,
+			Type:    ConditionProgressingDojo,
 			Status:  metav1.ConditionFalse,
 			Reason:  ReasonFinished,
 			Message: "All replicas are synchronized and ready",
 		})
 	} else {
 		meta.SetStatusCondition(&dojo.Status.Conditions, metav1.Condition{
-			Type:    typeProgressingDojo,
+			Type:    ConditionProgressingDojo,
 			Status:  metav1.ConditionTrue,
 			Reason:  ReasonScaling,
 			Message: fmt.Sprintf("Waiting for replicas: %d/%d ready", readyReplicas, desiredReplicas),
@@ -167,60 +256,60 @@ func (r *DojoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	// Set Degraded Condition (Clear it since we reached the end successfully)
 	meta.SetStatusCondition(&dojo.Status.Conditions, metav1.Condition{
-		Type:    typeDegradedDojo,
+		Type:    ConditionDegradedDojo,
 		Status:  metav1.ConditionFalse,
 		Reason:  ReasonHealthy,
 		Message: "Reconciliation successful",
 	})
 
 	if err := r.Status().Update(ctx, dojo); err != nil && !apierrors.IsConflict(err) {
-		return ctrl.Result{}, err
+		return &ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, nil
+	return &ctrl.Result{}, nil
 }
 
 // setUnrecoverableErrorStatus sets the Degraded state and returns the error
-func (r *DojoReconciler) setUnrecoverableErrorStatus(ctx context.Context, dojo *corev1.Dojo, reason, msg string) (ctrl.Result, error) {
+func (r *DojoReconciler) setUnrecoverableErrorStatus(ctx context.Context, dojo *corev1.Dojo, reason, msg string) (*ctrl.Result, error) {
 	meta.SetStatusCondition(&dojo.Status.Conditions, metav1.Condition{
-		Type:    typeDegradedDojo,
+		Type:    ConditionDegradedDojo,
 		Status:  metav1.ConditionTrue,
 		Reason:  reason,
 		Message: msg,
 	})
 	// If we hit an unrecoverable error, we aren't progressing anymore
 	meta.SetStatusCondition(&dojo.Status.Conditions, metav1.Condition{
-		Type:   typeProgressingDojo,
+		Type:   ConditionProgressingDojo,
 		Status: metav1.ConditionFalse,
 		Reason: reason,
 	})
 	err := r.Status().Update(ctx, dojo)
 	if err != nil && apierrors.IsConflict(err) {
-		return ctrl.Result{}, nil
+		return &ctrl.Result{}, nil
 	}
-	return ctrl.Result{}, err
+	return &ctrl.Result{}, err
 }
 
 // setProgressStatus sets the Progressing state and returns success
-func (r *DojoReconciler) setProgressStatus(ctx context.Context, dojo *corev1.Dojo, reason, msg string) (ctrl.Result, error) {
+func (r *DojoReconciler) setProgressStatus(ctx context.Context, dojo *corev1.Dojo, reason, msg string) (*ctrl.Result, error) {
 	meta.SetStatusCondition(&dojo.Status.Conditions, metav1.Condition{
-		Type:    typeProgressingDojo,
+		Type:    ConditionProgressingDojo,
 		Status:  metav1.ConditionTrue,
 		Reason:  reason,
 		Message: msg,
 	})
 	// Ensure Degraded is false while we are making progress
 	meta.SetStatusCondition(&dojo.Status.Conditions, metav1.Condition{
-		Type:   typeDegradedDojo,
+		Type:   ConditionDegradedDojo,
 		Status: metav1.ConditionFalse,
 		Reason: reason,
 	})
 
 	err := r.Status().Update(ctx, dojo)
 	if err != nil && apierrors.IsConflict(err) {
-		return ctrl.Result{}, nil
+		return &ctrl.Result{}, nil
 	}
-	return ctrl.Result{}, err
+	return &ctrl.Result{}, err
 }
 
 func (r *DojoReconciler) labels(name string) map[string]string {
@@ -282,9 +371,15 @@ func (r *DojoReconciler) deploymentForDojo(dojo *corev1.Dojo) (*appsv1.Deploymen
 							ContainerPort: 8080,
 							Name:          "http",
 						}},
-						// Application requires credentials to for Postgres database which are not set.
-						// Override it with dummy command.
-						Command: []string{"sleep", "infinity"},
+						EnvFrom: []k8scorev1.EnvFromSource{
+							{
+								SecretRef: &k8scorev1.SecretEnvSource{
+									LocalObjectReference: k8scorev1.LocalObjectReference{Name: dojo.Status.Credentials.Name},
+									Optional:             ptr.To(false),
+								},
+							},
+						},
+						WorkingDir: "/tmp", // to write traces.json
 					}},
 				},
 			},
@@ -299,11 +394,54 @@ func (r *DojoReconciler) deploymentForDojo(dojo *corev1.Dojo) (*appsv1.Deploymen
 	return dep, nil
 }
 
+func (r *DojoReconciler) findDojosForSecret(ctx context.Context, obj client.Object) []reconcile.Request {
+	secret, ok := obj.(*k8scorev1.Secret)
+	if !ok {
+		return nil
+	}
+
+	// Check if this secret belongs to a CNPG cluster
+	_, isCnpg := secret.Labels["cnpg.io/cluster"]
+	if !isCnpg {
+		return nil
+	}
+
+	// Match this secret back to your Dojo.
+	// Query all Dojos to see which one references this cluster
+	dojos := &corev1.DojoList{}
+	err := r.List(ctx, dojos)
+	if err != nil {
+		return nil
+	}
+
+	var requests []reconcile.Request
+	for _, dojo := range dojos.Items {
+		// Only trigger if this Shop is supposed to use this specific DB cluster
+		if ptr.Deref(dojo.Spec.Database, "") == corev1.DatabasePostgres &&
+			dojo.Spec.CredentialsRef.Name == secret.Name &&
+			dojo.Spec.CredentialsRef.Namespace == secret.Namespace {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      dojo.Name,
+					Namespace: dojo.Namespace,
+				},
+			})
+		}
+	}
+	return requests
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *DojoReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Dojo{}).
 		Owns(&appsv1.Deployment{}).
+		Owns(&k8scorev1.Secret{}).
+		Watches(
+			&k8scorev1.Secret{},
+			handler.EnqueueRequestsFromMapFunc(r.findDojosForSecret),
+			builder.WithPredicates(predicate.LabelChangedPredicate{}),
+		).
 		Named("dojo").
 		Complete(r)
 }
