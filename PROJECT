@@ -6,6 +6,10 @@ cliVersion: 4.11.0
 domain: jutsu.com
 layout:
 - go.kubebuilder.io/v4
+plugins:
+  helm.kubebuilder.io/v2-alpha:
+    manifests: dist/install.yaml
+    output: dist
 projectName: dojo-operator
 repo: github.com/DanijelRadakovic/dojo-operator
 resources:
