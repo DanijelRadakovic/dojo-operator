@@ -78,11 +78,24 @@ type DojoStatus struct {
 	// to desired replicas (e.g., "1/3"). This is used primarily for display in kubectl.
 	// +optional
 	ReadyStatus string `json:"readyStatus,omitempty"`
+
+	// Selector is required for HPA to work with CRDs.
+	// It must be the string representation of the label selector.
+	// +optional
+	Selector string `json:"selector,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:path=dojos
+// +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.readyReplicas,selectorpath=.status.selector
+// +kubebuilder:resource:shortName=dj,categories={all}
+// +kubebuilder:printcolumn:name="READY",type="string",JSONPath=".status.readyStatus"
+// +kubebuilder:printcolumn:name="UP-TO-DATE",type="integer",JSONPath=".status.updatedReplicas"
+// +kubebuilder:printcolumn:name="AVAILABLE",type="integer",JSONPath=".status.availableReplicas"
+// +kubebuilder:printcolumn:name="ACCOUNT",type="string",JSONPath=".spec.accountId"
+// +kubebuilder:printcolumn:name="STORAGE",type="string",JSONPath=".spec.storage",priority=1
+// +kubebuilder:printcolumn:name="AGE",type="date",JSONPath=".metadata.creationTimestamp"
 
 // Dojo is the Schema for the dojos API
 type Dojo struct {
