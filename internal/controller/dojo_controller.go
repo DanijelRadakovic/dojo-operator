@@ -126,6 +126,7 @@ func (r *DojoReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	readyReplicas := found.Status.ReadyReplicas
 	dojo.Status.ReadyReplicas = readyReplicas
+	dojo.Status.Selector = r.labelsSelector(dojo.Name)
 	dojo.Status.UpdatedReplicas = found.Status.UpdatedReplicas
 	dojo.Status.AvailableReplicas = found.Status.AvailableReplicas
 	dojo.Status.ReadyStatus = fmt.Sprintf("%d/%d", readyReplicas, desiredReplicas)
